@@ -1,79 +1,73 @@
-# main.py (or any other file in your project)
-from config.mongo_connection import client
+# my_package/insert.py
+"""
+Build movie_docs from SQL models, insert into MovieEmbedding table and build FAISS index.
+Run this after you've migrated Mongo -> SQL (main.py).
+"""
 from config.db_config import SessionLocal
-from Model.Schema import Movie, Genre, Cast, Language, Country, Director, Comment, Theater
-from my_package.insertMovie import insert_movie_from_json
-from Model.Schema import Base
-from config.db_config import engine
-import pandas as pd
-Base.metadata.create_all(engine)
-# You can now use the 'client' object to interact with MongoDB
-# For example, accessing a database:
-db = client['sample_mflix']
-# Example operation: Get a list of collections in the database
-collections = db.list_collection_names()
-movies = list(db["movies"].find())
+from Model.Schema import Movie, MovieEmbedding
+from .build_faiss_index import build_faiss_index
+import logging
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+def insert_movie_docs(movie_docs):
+    """
+    Persist movie_docs into MovieEmbedding table. movie_docs: list of {'id': str, 'text': str}
+    """
+    session = SessionLocal()
+    try:
+        for doc in movie_docs:
+            movie_id = str(doc["id"])
+            text = doc["text"]
+            entry = MovieEmbedding(id=movie_id, text=text)
+            session.merge(entry)
+        session.commit()
+        logger.info("Inserted/updated %d MovieEmbedding rows", len(movie_docs))
+    except Exception as e:
+        session.rollback()
+        logger.exception("Failed to insert movie docs: %s", e)
+        raise
+    finally:
+        session.close()
 
-# # df = pd.json_normalize(movies)
-# # print(df.head())
-session = SessionLocal()
-# # Fetch shared theaters
-# all_theaters = list(db["theaters"].find())
+def process_and_index_movies():
+    session = SessionLocal()
+    try:
+        movies = session.query(Movie).all()
+        movie_docs = []
+        for movie in movies:
+            parts = []
+            # Basic text concatenation: keep the same fields as before
+            if movie.title:
+                parts.append(f"Title: {movie.title}")
+            if movie.plot:
+                parts.append(f"Plot: {movie.plot}")
+            if movie.fullplot:
+                parts.append(f"Full Plot: {movie.fullplot}")
+            if movie.genres:
+                parts.append("Genres: " + ", ".join(g.genre for g in movie.genres if g.genre))
+            if movie.cast:
+                parts.append("Cast: " + ", ".join(c.name for c in movie.cast if c.name))
+            if movie.directors:
+                parts.append("Directors: " + ", ".join(d.name for d in movie.directors if d.name))
+            if movie.comments:
+                comments_str = " | ".join(f"{c.name}: {c.text[:200]}" for c in movie.comments if c.text and c.name)
+                parts.append("Comments: " + comments_str)
 
-# for theater_doc in all_theaters:
-#     # Convert ObjectId to string if needed
-#     theater_doc['id'] = str(theater_doc['_id'])
-#     # Remove _id to avoid SQLAlchemy confusion
-#     theater_doc.pop('_id', None)
-#     # Check if theater already exists before inserting
-#     exists = session.query(Theater).filter_by(id=theater_doc['id']).first()
-#     if not exists:
-#         session.add(Theater(**theater_doc))
-# session.commit()
-def convert_keys(theater_doc):
-    return {
-        
-        "theater_id": theater_doc["theaterId"],
-        "street1": theater_doc.get("location", {}).get("address", {}).get("street1"),
-        "city": theater_doc.get("location", {}).get("address", {}).get("city"),
-        "state": theater_doc.get("location", {}).get("address", {}).get("state"),
-        "zipcode": theater_doc.get("location", {}).get("address", {}).get("zipcode"),
-        "geo_type": theater_doc.get("location", {}).get("geo", {}).get("type"),
-        "geo_lat": theater_doc.get("location", {}).get("geo", {}).get("coordinates", [None, None])[1],
-        "geo_long": theater_doc.get("location", {}).get("geo", {}).get("coordinates", [None, None])[0],
-    }
+            text = "\n".join(parts).strip()
+            movie_docs.append({"id": str(movie._id), "text": text})
 
-all_theaters = list(db["theaters"].find())
+        logger.info("Built %d movie_docs from DB", len(movie_docs))
 
-for theater_doc in all_theaters:
-    theater_doc['id'] = str(theater_doc['_id'])
-    theater_doc.pop('_id', None)
-    exists = session.query(Theater).filter_by(id=theater_doc['id']).first()
-    if not exists:
-        theater = Theater(**convert_keys(theater_doc))
-        session.add(theater)
-session.commit()
+        # insert into MovieEmbedding table
+        insert_movie_docs(movie_docs)
 
+        # build FAISS index and save files in project root
+        index, ids = build_faiss_index(movie_docs, faiss_index_path='movie_index.faiss', ids_path='movie_ids.pkl')
+        logger.info("FAISS index created. Indexed %d docs.", index.ntotal)
+    finally:
+        session.close()
 
-# # Insert movies and related data
-# # Insert movies and related data
-def migrate_mflix_data(): ## this migrate function helps to conver the mongodb json data into sql 
-    for movie_doc in db["movies"].find({},no_cursor_timeout=True):
-        movie_id = movie_doc["_id"]
-        movie_doc["comments"] = list(db["comments"].find({"movie_id": movie_id}))
-        movie_doc["theaters"] = all_theaters  # Optional filtering can be done here
-        insert_movie_from_json(movie_doc, session)
-        print("The movies from mongoDB migrated into sql data with flatterd nature and foriegn keys....")
-
-# insert_movie_from_json(movie_doc, session)
-# print(df.isnull().sum())
-# Print out the collections in your database
-# print(movies)
-# print(f"Collections in database '{db.name}':")
-# for collection in collections:
-#     print(collection)
-
-
-migrate_mflix_data()
+if __name__ == "__main__":
+    process_and_index_movies()
